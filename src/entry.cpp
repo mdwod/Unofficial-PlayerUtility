@@ -96,12 +96,11 @@ struct Member
 
 static std::mutex          g_mutex;
 static std::vector<Member> g_members;
-// Version = date of the build (year, month, day) and the number of the build of that day.
-// Used for the Nexus add-on list and for the User-Agent of the web requests.
-static constexpr int VERSION_MAJOR = 2026;
-static constexpr int VERSION_MINOR = 10;
-static constexpr int VERSION_BUILD = 10;
-static constexpr int VERSION_REVISION = 1;
+// Version of the release (0.3.1). Used for the Nexus add-on list and for the User-Agent of the web requests.
+static constexpr int VERSION_MAJOR = 0;
+static constexpr int VERSION_MINOR = 3;
+static constexpr int VERSION_BUILD = 1;
+static constexpr int VERSION_REVISION = 0;
 
 static bool                g_visible = false; // hidden until the keybind is pressed
 
@@ -167,6 +166,7 @@ static bool  g_showTriangles = true;               // triangles in the wing / st
 static int   g_bossAlign = 1;                    // alignment of the numbers (0 left, 1 center, 2 right)
 static int   g_cofferValue = 3;                    // how many tokens one coffer counts as (0..5)
 static int   g_activeTab = 0;                    // 0 General, 1 Raid, 2 Raid Cm, 3 Strikes, 4 Strikes Cm, 5 Comments, 6 Debug (tab drawn last frame)
+static float g_tableBottomReserve = 0.0f;           // height kept free under the table for a fixed bar (Comments tab: the Add button)
 static float g_extraHeight = 0.0f;                 // height of a horizontal scrollbar, added to the window height
 
 // Threshold highlight (dropdown + number field next to the search box)
@@ -2614,10 +2614,108 @@ static void HighlightEnd(const Member& m, int columnIndex, CellRect r, float row
     else { g_hlRow = m.Account; g_hlCol = columnIndex; }
 }
 
+// "Add" in the Comments tab: an extra row at the top where the account name is typed. Nothing is stored
+// until the name is confirmed with Enter; then the row becomes a normal "Add Note" row for that account.
+static bool g_newRowActive = false; // the row for a new account is shown
+static char g_newName[64] = "";    // text in its account box
+static bool g_newFocus = false; // put the cursor into the account box
+static bool g_newWasActive = false; // the box was in use in the last frame
+static bool g_newBad = false; // Enter was pressed with a name that is not valid (red box)
+
+// "Name.1234": a name without a dot, then a dot and four digits. Spaces around it are removed.
+static bool NormalizeAccountName(const char* in, std::string& out)
+{
+    std::string t = in;
+    const size_t a = t.find_first_not_of(" \t");
+    const size_t b = t.find_last_not_of(" \t");
+    if (a == std::string::npos) return false;
+    t = t.substr(a, b - a + 1);
+    if (t.size() < 6) return false;
+    const size_t dot = t.size() - 5;
+    if (t[dot] != '.') return false;
+    for (size_t k = dot + 1; k < t.size(); ++k)
+        if (t[k] < '0' || t[k] > '9') return false;
+    for (size_t k = 0; k < dot; ++k)
+    {
+        const unsigned char c = (unsigned char)t[k];
+        if (c < 0x20 || c == '.') return false; // no tab / line break (the notes file uses tabs), one dot only
+    }
+    out = t;
+    return true;
+}
+
+// The cells of the row for a new account (Account is empty)
+static void DrawNewAccountCell(int col, float rowHeight)
+{
+    if (col == COL_DATE)
+    {
+        CenterVertically(rowHeight, ImGui::GetTextLineHeight());
+        AlignedText("-", g_align[COL_DATE]);
+        return;
+    }
+    if (col != COL_ACCOUNT)
+    {
+        CenterVertically(rowHeight, ImGui::GetTextLineHeight());
+        ImGui::TextDisabled("Enter the account name and press Enter");
+        return;
+    }
+
+    const ImGuiStyle& st = ImGui::GetStyle();
+    float padY = (rowHeight - 2.0f * st.CellPadding.y - ImGui::GetFontSize()) * 0.5f;
+    if (padY < 0.0f) padY = 0.0f;
+    if (padY > st.FramePadding.y) padY = st.FramePadding.y;
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(st.FramePadding.x, padY));
+    CenterVertically(rowHeight, ImGui::GetFrameHeight());
+
+    const bool redBox = g_newBad;
+    if (redBox) ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.55f, 0.10f, 0.10f, 0.85f));
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+    if (g_newFocus)
+    {
+        ImGui::SetKeyboardFocusHere();
+        ImGui::SetScrollY(0.0f); // the new row is the first row
+        g_newFocus = false;
+    }
+    const bool enter = ImGui::InputTextWithHint("##newaccount", "Name.1234", g_newName, sizeof(g_newName),
+        ImGuiInputTextFlags_EnterReturnsTrue);
+    const bool active = ImGui::IsItemActive();
+    if (ImGui::IsItemEdited()) g_newBad = false;
+    if (ImGui::IsItemHovered()) PuTooltip("Account name like Name.1234, then press Enter");
+    if (redBox) ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+
+    if (enter)
+    {
+        std::string name;
+        if (!NormalizeAccountName(g_newName, name))
+        {
+            g_newBad = true;   // red box, stay in the field
+            g_newFocus = true;
+        }
+        else
+        {
+            const auto it = g_notes.find(name);
+            const bool hasNote = it != g_notes.end() && !it->second.Text.empty();
+            g_newRowActive = false;
+            g_newName[0] = '\0';
+            g_newBad = false;
+            g_newWasActive = false;
+            RequestNoteEdit(name, !hasNote); // existing note: show it; new account: cursor in its note field
+        }
+        return;
+    }
+
+    // left the box without a name: the empty row disappears again
+    if (g_newWasActive && !active && !g_newFocus && g_newName[0] == '\0') g_newRowActive = false;
+    g_newWasActive = active;
+}
+
 // Draws one cell of a player row. "col" is a column id (COL_ACCOUNT, COL_GROUP, ...)
 static void DrawCell(int col, const Member& m, float rowHeight)
 {
     char buf[16];
+
+    if (m.Account.empty()) { DrawNewAccountCell(col, rowHeight); return; } // the row for a new account (Comments tab)
 
     if (col != COL_NOTES) // the note field is centered below, it has its own height
         CenterVertically(rowHeight, ImGui::GetTextLineHeight());
@@ -2900,7 +2998,7 @@ static void DrawTable(const char* tabId, const std::vector<int>& cols, const std
 
     if (ImGui::BeginTable(tableId, (int)cols.size(),
         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-        ImGuiTableFlags_ScrollY | ImGuiTableFlags_NoSavedSettings))
+        ImGuiTableFlags_ScrollY | ImGuiTableFlags_NoSavedSettings, ImVec2(0.0f, -g_tableBottomReserve)))
     {
         // columns are created in the order chosen in the options (cols)
         for (int p = 0; p < (int)cols.size(); ++p)
@@ -2949,7 +3047,7 @@ static void DrawTable(const char* tabId, const std::vector<int>& cols, const std
         for (const Member& m : rows)
         {
             const bool isMe = keepSelf && !g_self.empty() && m.Account == g_self;
-            if (!isMe && !MatchesSearch(m)) continue;
+            if (!isMe && !m.Account.empty() && !MatchesSearch(m)) continue;
 
             ImGui::TableNextRow(ImGuiTableRowFlags_None, rowHeight);
             if (!g_noteReqAccount.empty() && g_activeTab == 5 && SameAccount(m.Account, g_noteReqAccount))
@@ -3951,12 +4049,32 @@ static void DrawCommentsTab()
             return x.Account < y.Account;
         });
 
+    // the row for a new account is the first row
+    if (g_newRowActive) rows.insert(rows.begin(), Member());
+
     // number of accounts that really have a comment (not counting a row being emptied right now)
     int total = 0;
     for (const auto& kv : g_notes)
         if (!kv.second.Text.empty()) ++total;
 
+    // the table leaves room for a bar at the bottom of the window that stays in place while the list scrolls
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float barHeight = ImGui::GetFrameHeight() + 2.0f * st.ItemSpacing.y + 2.0f; // gap, 2 px, gap, button
+    g_tableBottomReserve = barHeight;
     DrawTable("comments", ColumnsInOrder(TAB_COMMENTS), rows, total);
+    g_tableBottomReserve = 0.0f;
+    g_extraHeight = barHeight; // the window is that much taller (measured like the table, used in the next frame)
+
+    // "Add": a row where the name of an account is typed (the account does not have to be in the group)
+    ImGui::Dummy(ImVec2(0.0f, 2.0f));
+    if (ImGui::Button("Add"))
+    {
+        g_newRowActive = true;
+        g_newFocus = true;
+        g_search[0] = '\0'; // so a search does not hide the row
+        g_searchLower.clear();
+    }
+    if (ImGui::IsItemHovered()) PuTooltip("Add a note for any account, even if it is not in your group");
 }
 
 // Threshold entry that fits the tab and the data source: UFE on General, Kp.me or Logs on the raid / strike tabs.
@@ -4351,13 +4469,14 @@ static void AddonRender()
                 DrawCommentsTab();
                 ImGui::EndTabItem();
             }
-            if (g_debug && ImGui::BeginTabItem("Debug"))
+            if (g_debug && ImGui::BeginTabItem("Advanced"))
             {
                 g_activeTab = 6;
                 DrawDebugTab();
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
+            if (g_activeTab != 5) g_newRowActive = false; // the row for a new account is dropped when the tab is left
         }
 
         // click highlight: switching tabs clears it; so does a click elsewhere in the window (not on the title bar)
@@ -4815,7 +4934,7 @@ static void OptionsAdvancedTab()
     SectionHeading("Debug", true);
     if (ImGui::Checkbox("Show Debug Tab", &g_debug)) SaveSettings();
     OptionGap();
-    OptionDescription("Adds a Debug tab to the window with the event log of the add-on.");
+    OptionDescription("Adds an Advanced tab to the window with the event log of the add-on.");
 }
 
 // Shown in Nexus' options window: the tabs and a bottom row with Reset This Tab and Reset All
